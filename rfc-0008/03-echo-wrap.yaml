@@ -1,0 +1,103 @@
+# RFC 0008 / EXPR — Echo wrap environment (dry run)
+#
+# Intercepts every inner environment's onEnter/onExit and every task's onRun,
+# echoes the command that would have run in shell-quoted form, and does
+# nothing else. Useful for:
+#
+#   - Inspecting what a job template will actually do on a worker
+#   - Debugging template variable expansion (Task.Command, Task.Args,
+#     Task.Environment, Env.Wrapped.*)
+#   - Verifying that runOnHost: true correctly bypasses the wrapper for
+#     actions that need to run on the host (those will not appear in the
+#     wrapper's output because they're never routed through it)
+#
+# Notes:
+#   - Echoed lines are shell-quoted with repr_sh, so they're copy-paste
+#     runnable: you can grab the cmd: line and execute it as-is.
+#   - Every line is prefixed with [EchoWrap] so nothing accidentally looks
+#     like an `openjd_env: KEY=value` directive, which the scheduler scans
+#     for on the wrap hook's stdout.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+environment:
+  name: EchoWrap
+  description: >
+    Prints every wrapped inner environment action and every wrapped task run
+    in shell-quoted form, without executing them. Pure dry-run / tracer.
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo '[EchoWrap] session starting'"]
+
+      onWrapEnter:
+        command: bash
+        args: ["{{Env.File.WrapEnter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onWrapExit:
+        command: bash
+        args: ["{{Env.File.WrapExit}}"]
+
+      onExit:
+        command: bash
+        args: ["-c", "echo '[EchoWrap] session ending'"]
+
+    embeddedFiles:
+      - name: WrapEnter
+        filename: echo-wrap-enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "[EchoWrap] onEnter for env {{ repr_sh(Env.Wrapped.Name) }}"
+          echo "[EchoWrap]   env:     {{ repr_sh(Env.Wrapped.Environment) }}"
+          echo "[EchoWrap]   timeout: {{ Env.Wrapped.Timeout }}"
+          echo "[EchoWrap]   cmd:     {{ repr_sh(Env.Wrapped.Command) }} {{ repr_sh(Env.Wrapped.Args) }}"
+
+      - name: WrapTaskRun
+        filename: echo-wrap-task-run.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "[EchoWrap] onRun (task)"
+          echo "[EchoWrap]   env:     {{ repr_sh(Task.Environment) }}"
+          echo "[EchoWrap]   timeout: {{ Task.Timeout }}"
+          echo "[EchoWrap]   cmd:     {{ repr_sh(Task.Command) }} {{ repr_sh(Task.Args) }}"
+
+      - name: WrapExit
+        filename: echo-wrap-exit.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          echo "[EchoWrap] onExit for env {{ repr_sh(Env.Wrapped.Name) }}"
+          echo "[EchoWrap]   env:     {{ repr_sh(Env.Wrapped.Environment) }}"
+          echo "[EchoWrap]   timeout: {{ Env.Wrapped.Timeout }}"
+          echo "[EchoWrap]   cmd:     {{ repr_sh(Env.Wrapped.Command) }} {{ repr_sh(Env.Wrapped.Args) }}"
+
+# Expected output for a Blender render job with a BlenderSetup step env:
+#
+#   [EchoWrap] session starting
+#   [EchoWrap] onEnter for env 'BlenderSetup'
+#   [EchoWrap]   env:     'HOME=/home/worker' 'PATH=/usr/local/bin:/usr/bin'
+#   [EchoWrap]   timeout: 600
+#   [EchoWrap]   cmd:     pip install --quiet 'blender-batch==2.1'
+#   [EchoWrap] onRun (task)
+#   [EchoWrap]   env:     'HOME=/home/worker' 'PATH=/usr/local/bin:/usr/bin'
+#   [EchoWrap]   timeout: 3600
+#   [EchoWrap]   cmd:     blender --background '/scenes/robot.blend' --frame-set 1
+#   [EchoWrap] onExit for env 'BlenderSetup'
+#   [EchoWrap]   env:     'HOME=/home/worker' 'PATH=/usr/local/bin:/usr/bin'
+#   [EchoWrap]   timeout: 600
+#   [EchoWrap]   cmd:     pip uninstall --yes blender-batch
+#   [EchoWrap] session ending

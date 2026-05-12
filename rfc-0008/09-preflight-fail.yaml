@@ -1,0 +1,133 @@
+# RFC 0008 / EXPR — Preflight validation with fail()
+#
+# fail(msg) returns `noreturn`, which composes cleanly with `or` and `and` for
+# assertion-style invariants. Because EXPR is evaluated at template / session
+# time, these checks surface errors at submission — NOT three hours into a job
+# when the bad command finally tries to run.
+#
+# Patterns shown:
+#   1. Non-empty command guard
+#   2. Banned flag detection in Task.Args
+#   3. Path allow-list for arguments that look like file paths
+#   4. Arg-count ceiling to protect against ARG_MAX after wrap-doubling
+#   5. Inner-env name policy (require a naming convention)
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: MaxArgsAfterWrap
+    type: INT
+    default: 500
+
+environment:
+  name: WrapWithPreflight
+  description: >
+    Docker wrap environment that rejects dangerous inputs at eval time using
+    fail(). No chance for a broken command to ever reach docker.
+  script:
+    let:
+      # Flags we refuse to forward into the container, regardless of intent.
+      - banned_flags = ['--privileged', '--cap-add', '--pid=host', '--network=host']
+
+      # Path prefixes the inner task is allowed to read/write from.
+      - allowed_path_prefixes = ['/sessions/', '/mnt/renders/', '/tmp/']
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'container start (omitted)'"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      # Demonstrates validating the inner env's name before doing ANYTHING.
+      onWrapEnter:
+        command: bash
+        args: ["{{Env.File.WrapEnter}}"]
+        timeout: "{{Env.Wrapped.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'container stop (omitted)'"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: wrap-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # ── Preflight 1: non-empty command ────────────────────────────
+          # An empty Task.Command would produce a silently-passing `docker
+          # exec <container>` that does nothing; catch it explicitly.
+          {{
+            Task.Command.strip() != ''
+              or fail('Refusing to wrap an empty command')
+          }}
+
+          # ── Preflight 2: no banned flags in args ──────────────────────
+          # The double-nested `any` checks whether any arg matches any
+          # banned flag prefix. `not ... or fail()` is the assert idiom.
+          {{
+            not any([
+              any([a.startswith(b) for b in banned_flags])
+              for a in Task.Args
+            ]) or fail('A banned flag (e.g. --privileged) appeared in Task.Args')
+          }}
+
+          # ── Preflight 3: path allow-list ──────────────────────────────
+          # Arguments that look like absolute paths must start with an
+          # allow-listed prefix. Uses a list comprehension + `all` to
+          # check every candidate path arg.
+          {{
+            all([
+              any([a.startswith(p) for p in allowed_path_prefixes])
+              for a in Task.Args
+              if a.startswith('/')
+            ]) or fail('An absolute-path arg is outside the allow-list')
+          }}
+
+          # All checks passed — forward the command safely.
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([['-e', e] for e in Task.Environment])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}
+
+      - name: WrapEnter
+        filename: wrap-enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # ── Preflight 5: inner env name convention ────────────────────
+          # Require the inner env name match our team's convention, so a
+          # typo or imported-from-elsewhere env doesn't slip through.
+          {{
+            re_match(Env.Wrapped.Name or '', r'^(Setup|Install|Render|Composite)$') != null
+              or fail('Inner env name must be one of Setup/Install/Render/Composite')
+          }}
+
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(Env.Wrapped.Command) }} \
+              {{ repr_sh(Env.Wrapped.Args) }}
+
+# ─── Preflight 4: template-level arg-count ceiling ───────────────────────
+#
+# Defending against ARG_MAX / cmd-line-length limits after wrap "doubling"
+# can also live at the action-level. The ternary chooses either the real
+# script path or a call into fail():
+#
+#   onWrapTaskRun:
+#     command: bash
+#     args:
+#       - "{{ Env.File.WrapTaskRun if len(Task.Args) < Param.MaxArgsAfterWrap
+#             else fail('Task has too many args to fit in ARG_MAX after wrapping') }}"

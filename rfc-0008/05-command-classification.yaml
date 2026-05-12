@@ -1,0 +1,85 @@
+# RFC 0008 / EXPR — Command classification and runtime routing
+#
+# Task.Command is a plain string, so re_match, `in`, and equality checks let
+# the wrap hook pick different runtime flags — or even a different container
+# image — based on WHAT is being wrapped.
+#
+# Patterns shown:
+#   1. Runtime flag selection via regex on the command name
+#   2. Membership check (`in`) for privileged-package-manager escalation
+#   3. Apptainer image selection per command (daemonless runtime where the
+#      image is part of each exec)
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: Runtime
+    type: STRING
+    allowedValues: ["docker", "apptainer"]
+    default: "docker"
+
+environment:
+  name: SmartRuntime
+  description: >
+    Routes wrapped commands to GPU flags, elevated users, or per-command
+    container images based on the command being run.
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'runtime prep (omitted)'"]
+
+      # DOCKER onWrapTaskRun — GPU + user classification via regex
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'runtime teardown (omitted)'"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: classify-and-route.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # --- Docker routing example ---
+          # GPU-sensitive DCCs get --gpus all. Package managers get --user root.
+          # Everything else runs as the default user without GPU.
+          docker container exec \
+              {{ '--gpus all' if re_match(Task.Command, r'.*(blender|maya|houdini|nuke)$') else '' }} \
+              {{ '--user root' if Task.Command in ['apt-get', 'yum', 'dnf', 'apk'] else '' }} \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([['-e', e] for e in Task.Environment])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}
+
+      # --- Apptainer-style per-command image selection ---
+      # Swap the args on onWrapTaskRun to use this file instead of the one
+      # above when running on the Apptainer runtime.
+      - name: WrapTaskRunApptainer
+        filename: apptainer-per-cmd.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Each exec picks its own image based on the wrapped command.
+          # Chained ternaries = if/elif/else in EXPR.
+          apptainer exec \
+              --bind {{ repr_sh(string(Session.WorkingDirectory)) }} \
+              {{ repr_sh(
+                   'docker://vfx/maya:2025'     if Task.Command == 'maya' else
+                   'docker://vfx/blender:4.2'   if Task.Command == 'blender' else
+                   'docker://vfx/houdini:20.0'  if Task.Command == 'houdini' else
+                   'docker://vfx/base:latest'
+                 ) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}

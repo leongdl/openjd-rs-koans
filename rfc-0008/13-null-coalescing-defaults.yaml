@@ -1,0 +1,109 @@
+# RFC 0008 / EXPR — Null-coalescing and optional defaults
+#
+# EXPR's `and`/`or` are null-coalescing (not Python-truthy). Only `false` and
+# `null` are falsy — `0`, `""`, and `[]` are NOT falsy. That makes `or` the
+# perfect operator for "use this, else this fallback":
+#
+#     X or DEFAULT           →  X unless X is null/false
+#     X and Y                →  Y if X is set, else X (useful as a guard)
+#
+# Patterns shown:
+#   1. Default timeout when the wrapped action didn't specify one
+#   2. Parameter fallback when Override is unset
+#   3. Optional container tag with version default
+#   4. Guard pattern: only emit a flag when a related param is set
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: Override
+    type: STRING
+    default: ""                # empty string means "use DefaultImage"
+  - name: DefaultImage
+    type: STRING
+    default: "ubuntu:latest"
+  - name: ExtraArg
+    type: STRING
+    default: ""                # empty string means "don't add extra flag"
+
+environment:
+  name: DefaultsViaOr
+  script:
+    let:
+      # Pattern 2: parameter fallback — but note EXPR does NOT treat "" as
+      # falsy, so for string params we need an explicit == '' check.
+      - effective_image = Param.DefaultImage if Param.Override == '' else Param.Override
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Env.File.Enter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        # Pattern 1: Task.Timeout is the wrapped action's timeout. It's an
+        # int (with a spec default), so `or` isn't strictly needed — but
+        # when writing wrap hooks for types that CAN be null, the `or`
+        # idiom is the safe default.
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "docker container stop --timeout 30 $DOCKER_CONTAINER_ID || true"]
+
+    embeddedFiles:
+      - name: Enter
+        filename: enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # `effective_image` was resolved in `let` — always a usable string.
+          echo "[wrap] starting with image: {{ repr_sh(effective_image) }}"
+
+          DOCKER_CONTAINER_ID=$(docker container run --rm \
+              --pull never --detach --network host \
+              {{ repr_sh(effective_image) }} \
+              bash -c 'sleep infinity')
+          echo "openjd_env: DOCKER_CONTAINER_ID=$DOCKER_CONTAINER_ID"
+
+      - name: WrapTaskRun
+        filename: wrap-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Pattern 4: guard-style — emit ['--extra', value] when the param
+          # is non-empty, otherwise []. An `if`/`else` ternary with `== ''`
+          # is clearer than `or` for string params because of the falsy-set
+          # difference from Python.
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([['-e', e] for e in Task.Environment])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }} \
+              {{ repr_sh(
+                   ['--extra', Param.ExtraArg] if Param.ExtraArg != '' else []
+                 ) }}
+
+# ─── When `or` shines: nullable types ────────────────────────────────────
+#
+# The `or`-as-default idiom is cleanest when the operand type is genuinely
+# nullable. Env.Wrapped.Name, for example, is a string? — it can be null for
+# anonymous envs. This is where `or` does real work:
+#
+#     re_match(Env.Wrapped.Name or '', r'^Setup.*')
+#     echo "wrapping: {{ Env.Wrapped.Name or '<anonymous>' }}"
+#
+# Similarly for nullable numeric results:
+#
+#     timeout={{ Env.Wrapped.Timeout or 3600 }}
+#
+# For STRING params with an empty-string default, prefer `== ''` conditionals
+# because EXPR will NOT coerce "" to null.

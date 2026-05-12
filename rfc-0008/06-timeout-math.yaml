@@ -1,0 +1,94 @@
+# RFC 0008 / EXPR — Timeout arithmetic and graceful shutdown
+#
+# Task.Timeout and Env.Wrapped.Timeout are int (seconds). EXPR arithmetic and
+# min/max apply directly, which matters because:
+#
+#   - The wrap subprocess has its OWN timeout (set on the wrap action itself).
+#   - The wrap script needs to tell the inner runtime how long to wait for a
+#     graceful shutdown when cancelled — typically capped at a sane ceiling.
+#
+# Two tricks:
+#   1. Give the wrap subprocess slightly more time than the inner task so the
+#      wrapper has a window to stop the container cleanly after the inner
+#      deadline hits.
+#   2. Cap propagated shutdown timeouts with min() so a misconfigured 24-hour
+#      timeout doesn't stall cancellation.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+environment:
+  name: DockerWithGracefulShutdown
+  script:
+    let:
+      # Maximum time we're willing to wait for the container to stop cleanly.
+      - max_shutdown_seconds = 120
+      # Extra seconds granted to the wrap subprocess beyond the task's own
+      # timeout, so there's time to run `docker stop`.
+      - shutdown_buffer = 30
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'starting container (omitted)'"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        # The wrap subprocess gets Task.Timeout + buffer to run the task AND
+        # clean up. Env.Wrapped.Timeout / Task.Timeout are the wrapped
+        # action's timeout; the wrap's own timeout governs the wrapper itself.
+        timeout: "{{ Task.Timeout + shutdown_buffer }}"
+
+      onWrapEnter:
+        command: bash
+        args: ["{{Env.File.WrapEnter}}"]
+        timeout: "{{ Env.Wrapped.Timeout + shutdown_buffer }}"
+
+      onExit:
+        command: bash
+        args: ["{{Env.File.Exit}}"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: wrap-task-graceful.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # On SIGTERM from the scheduler (cancellation), stop the container
+          # with a capped graceful timeout. min() prevents a 24-hour inner
+          # timeout from stalling the worker's cancel.
+          trap 'docker container stop --timeout {{ min(Task.Timeout, max_shutdown_seconds) }} "$DOCKER_CONTAINER_ID" || true' TERM INT
+
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([['-e', e] for e in Task.Environment])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}
+
+      - name: WrapEnter
+        filename: wrap-enter-graceful.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          trap 'docker container stop --timeout {{ min(Env.Wrapped.Timeout, max_shutdown_seconds) }} "$DOCKER_CONTAINER_ID" || true' TERM INT
+
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([['-e', e] for e in Env.Wrapped.Environment])) }} \
+              {{ repr_sh(Env.Wrapped.Command) }} \
+              {{ repr_sh(Env.Wrapped.Args) }}
+
+      - name: Exit
+        filename: exit.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Session-end shutdown also capped.
+          docker container stop --timeout {{ max_shutdown_seconds }} "$DOCKER_CONTAINER_ID" || true

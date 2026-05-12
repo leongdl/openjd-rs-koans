@@ -1,0 +1,121 @@
+# RFC 0008 / EXPR — Cross-language wrap scripts via the repr_* family
+#
+# `repr_sh` is the default, but the library also ships `repr_py`, `repr_json`,
+# `repr_pwsh`, and `repr_cmd`. Each one applies the quoting rules of a
+# different target language, which means you can write wrap scripts in
+# whatever language matches your runtime:
+#
+#   - repr_py   → Python scripts (no shell quoting fragility)
+#   - repr_json → JSON manifests for runtimes that consume them
+#                 (podman kube play, nerdctl run --config, custom schedulers)
+#   - repr_pwsh → PowerShell wrappers for Windows containers
+#   - repr_cmd  → cmd.exe wrappers for legacy Windows
+#
+# Same safety guarantee as repr_sh: each interpolation becomes one
+# syntactically-safe token in the target language.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+environment:
+  name: MultiLanguageWrap
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'starting (omitted)'"]
+
+      # Demonstrates the Python-scripted wrapper (most robust on Linux).
+      onWrapTaskRun:
+        command: python3
+        args: ["{{Env.File.WrapTaskRunPy}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'stopping (omitted)'"]
+
+    embeddedFiles:
+
+      # ─── Python wrap script ────────────────────────────────────────────
+      # Bypasses shell quoting entirely. repr_py emits a valid Python literal.
+      - name: WrapTaskRunPy
+        filename: wrap-task-run.py
+        type: TEXT
+        data: |
+          #!/usr/bin/env python3
+          """Wrap a task by exec-ing it inside the session's Docker container."""
+          import os
+          import subprocess
+          import sys
+
+          # Each interpolation becomes a valid Python literal (list or string)
+          # that the parser reads directly — no shell involved.
+          env: dict[str, str] = os.environ.copy()
+          for pair in {{ repr_py(Task.Environment) }}:
+              key, _, value = pair.partition("=")
+              env[key] = value
+
+          cmd: list[str] = (
+              ["docker", "container", "exec", os.environ["DOCKER_CONTAINER_ID"]]
+              + [{{ repr_py(Task.Command) }}]
+              + {{ repr_py(Task.Args) }}
+          )
+          sys.exit(subprocess.call(cmd, env=env))
+
+      # ─── JSON manifest ─────────────────────────────────────────────────
+      # For runtimes that accept a JSON blob. repr_json produces a single
+      # JSON value that can be parsed directly by the runtime.
+      - name: PodSpec
+        filename: pod.json
+        type: TEXT
+        data: |
+          {{ repr_json({
+               'command': [Task.Command] + Task.Args,
+               'env': [
+                 {'name': e.split('=')[0], 'value': e.split('=', 1)[1]}
+                 for e in Task.Environment
+               ],
+               'timeout': Task.Timeout
+             }) }}
+
+      # ─── PowerShell wrap script ────────────────────────────────────────
+      # For Windows containers. repr_pwsh handles PowerShell's quoting rules.
+      - name: WrapTaskRunPs1
+        filename: wrap-task-run.ps1
+        type: TEXT
+        data: |
+          #Requires -Version 5
+          $ErrorActionPreference = 'Stop'
+
+          docker container exec $env:DOCKER_CONTAINER_ID `
+              {{ repr_pwsh(Task.Command) }} {{ repr_pwsh(Task.Args) }}
+          exit $LASTEXITCODE
+
+      # ─── cmd.exe wrap script ───────────────────────────────────────────
+      # Legacy Windows. repr_cmd handles cmd's (very different) quoting rules.
+      - name: WrapTaskRunBat
+        filename: wrap-task-run.bat
+        type: TEXT
+        data: |
+          @echo off
+          docker container exec %DOCKER_CONTAINER_ID% {{ repr_cmd(Task.Command) }} {{ repr_cmd(Task.Args) }}
+
+# To use a non-default wrapper, change the onWrapTaskRun action:
+#
+#   # PowerShell
+#   onWrapTaskRun:
+#     command: powershell
+#     args: ["-File", "{{Env.File.WrapTaskRunPs1}}"]
+#
+#   # cmd.exe
+#   onWrapTaskRun:
+#     command: cmd
+#     args: ["/c", "{{Env.File.WrapTaskRunBat}}"]
+#
+#   # JSON-consuming runtime (hypothetical)
+#   onWrapTaskRun:
+#     command: my-runtime
+#     args: ["run", "--config", "{{Env.File.PodSpec}}"]

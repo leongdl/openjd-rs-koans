@@ -1,0 +1,13 @@
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Editor state
+.vscode/
+.idea/
+*.swp
+*~
+
+# Scratch / local
+tmp/
+.scratch/

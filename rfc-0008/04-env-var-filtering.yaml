@@ -1,0 +1,99 @@
+# RFC 0008 / EXPR — Environment variable filtering and transformation
+#
+# Task.Environment and Env.Wrapped.Environment are list[string] of "KEY=value"
+# entries. Once they're lists, list comprehensions + string functions turn a
+# wrap hook into a secrets firewall, a namespace translator, and an injector.
+#
+# Four patterns shown below:
+#   1. Blacklist — drop anything that looks like a credential
+#   2. Whitelist — forward only known-safe prefixes
+#   3. Rewrite   — translate HOST_* keys to CONTAINER_*
+#   4. Inject    — prepend wrap-owned env vars the inner action should see
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: ContainerImage
+    type: STRING
+    default: "ubuntu:latest"
+
+environment:
+  name: DockerEnvFiltered
+  script:
+    let:
+      # Prefixes we never want crossing the container boundary.
+      - secret_prefixes = [
+          'AWS_SECRET_', 'AWS_SESSION_TOKEN',
+          'TOKEN_', 'SECRET_', 'PASSWORD', 'PRIVATE_',
+          'GITHUB_TOKEN', 'SSH_'
+        ]
+      # Prefixes that ARE safe to forward (for whitelist mode).
+      - allowed_prefixes = [
+          'JOB_', 'STEP_', 'RENDER_', 'OPENJD_',
+          'PATH=', 'HOME=', 'LANG='
+        ]
+      # Wrap-owned env vars to inject into every wrapped action.
+      - injected = [
+          'WRAPPED_BY=docker',
+          'WRAP_CONTAINER=' + Param.ContainerImage
+        ]
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'starting docker container (omitted for brevity)'"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'stopping docker container (omitted for brevity)'"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: wrap-filtered.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Pattern 1 — BLACKLIST: drop any env var matching a secret prefix.
+          # The outer `not any([...])` returns true only when the entry does
+          # NOT start with any secret prefix.
+          #
+          # Pattern 4 — INJECT: prepend our `injected` list to the filtered
+          # task environment before forwarding.
+          docker container exec \
+              $DOCKER_CONTAINER_ID \
+              {{ repr_sh(flatten([
+                   ['-e', e]
+                   for e in injected + [
+                     e for e in Task.Environment
+                     if not any([e.startswith(p) for p in secret_prefixes])
+                   ]
+                 ])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}
+
+# ─── Alternative filter styles — swap into the pipeline above as needed ───
+#
+# Pattern 2 — WHITELIST (only forward known-safe vars):
+#
+#   flatten([['-e', e] for e in Task.Environment
+#            if any([e.startswith(p) for p in allowed_prefixes])])
+#
+# Pattern 3 — REWRITE keys (HOST_* → CONTAINER_*):
+#
+#   flatten([['-e', e.replace('HOST_', 'CONTAINER_', 1)] for e in Task.Environment])
+#
+# Combine: blacklist-then-rewrite by chaining two comprehensions via a let:
+#
+#   let:
+#     - filtered = [e for e in Task.Environment
+#                   if not any([e.startswith(p) for p in secret_prefixes])]
+#     - rewritten = [e.replace('HOST_', 'CONTAINER_', 1) for e in filtered]

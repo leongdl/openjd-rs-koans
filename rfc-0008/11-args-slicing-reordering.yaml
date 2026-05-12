@@ -1,0 +1,107 @@
+# RFC 0008 / EXPR — Slicing and list surgery on Task.Args
+#
+# Task.Args is list[string], so slicing (`[1:]`, `[::-1]`, `[:3]`) works
+# natively. That unlocks three real patterns:
+#
+#   1. Head/tail split — inspect the first arg and handle the rest as a bulk
+#   2. Flag reordering — put all `--flag` args before positional args for
+#      picky legacy binaries
+#   3. Bounded arg truncation — drop everything past the first N args
+#
+# These are the kind of transformations you'd otherwise do in the task
+# wrapper itself, but doing them in EXPR means the wrap script sees the
+# already-rewritten args and stays simple.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+environment:
+  name: ArgSurgery
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'container start (omitted)'"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'container stop (omitted)'"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: arg-surgery.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # ── Pattern 1: Head/tail split ────────────────────────────────
+          # Look at the first arg to decide behavior. Ternary on len() so
+          # it's safe when Task.Args is empty.
+          FIRST={{ repr_sh(Task.Args[0] if len(Task.Args) > 0 else '') }}
+          REST={{ repr_sh(Task.Args[1:]) }}
+
+          case "$FIRST" in
+              --gpu)
+                  # strip the --gpu marker, pass everything else through
+                  exec docker container exec --gpus all "$DOCKER_CONTAINER_ID" \
+                      {{ repr_sh(Task.Command) }} $REST
+                  ;;
+              --debug)
+                  # run under strace
+                  exec docker container exec "$DOCKER_CONTAINER_ID" \
+                      strace -f {{ repr_sh(Task.Command) }} $REST
+                  ;;
+              *)
+                  # default: run args unchanged
+                  exec docker container exec "$DOCKER_CONTAINER_ID" \
+                      {{ repr_sh(Task.Command) }} {{ repr_sh(Task.Args) }}
+                  ;;
+          esac
+
+      # ── Pattern 2: Flag reordering ─────────────────────────────────────
+      # Some legacy binaries require all flags before positional args.
+      # Two comprehensions: one pulling flags, one pulling positionals.
+      - name: WrapTaskRunReordered
+        filename: arg-reorder.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker container exec "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(
+                   [a for a in Task.Args if a.startswith('-')]
+                   + [a for a in Task.Args if not a.startswith('-')]
+                 ) }}
+
+      # ── Pattern 3: Bounded arg truncation ──────────────────────────────
+      # If a caller passes 10,000 args, keep the first 256 and append a
+      # marker indicating truncation. Guards against accidental runaway.
+      - name: WrapTaskRunBounded
+        filename: arg-bounded.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker container exec "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(
+                   Task.Args[:256] + ['--truncated-after-256'] if len(Task.Args) > 256
+                   else Task.Args
+                 ) }}
+
+# To use a non-default pattern, point onWrapTaskRun at the alternate file:
+#
+#   onWrapTaskRun:
+#     args: ["{{Env.File.WrapTaskRunReordered}}"]
+#
+#   onWrapTaskRun:
+#     args: ["{{Env.File.WrapTaskRunBounded}}"]

@@ -1,0 +1,110 @@
+# RFC 0008 / EXPR — Wine wrap for Windows binaries on Linux workers
+#
+# VFX studios frequently have one-off Windows-only tools (proprietary
+# plugins, licensed DCCs with no Linux build, legacy in-house code) that
+# need to run on a Linux render farm. Wine handles this, but every job
+# template would otherwise have to prepend `wine` to every command manually.
+#
+# A wrap env centralizes it. The template author writes the Windows command
+# naturally; the wrap layer translates `C:\path\foo.exe arg` into
+# `wine 'C:\path\foo.exe' arg` at execution time.
+#
+# Demonstrates:
+#   - Detecting Windows-style commands via regex on Task.Command
+#   - Conditional wrapping: only wrap .exe / .bat / .cmd, leave native Linux
+#     commands alone
+#   - Env var translation (WINEPREFIX, DISPLAY) for the Wine process
+#   - Path rewriting (wine Z: drive convention) for arguments that look
+#     like Linux paths
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: WinePrefix
+    type: PATH
+    default: "/opt/winerpefixes/default"
+  - name: WineArch
+    type: STRING
+    allowedValues: ["win32", "win64"]
+    default: "win64"
+
+environment:
+  name: WineWrap
+  description: >
+    Runs Windows .exe/.bat/.cmd commands through Wine; passes native Linux
+    commands through unchanged. Translates WINEPREFIX + WINEARCH setup.
+  script:
+    let:
+      # Shared Wine env setup for all wrap hooks.
+      - wine_env = [
+          'WINEPREFIX=' + string(Param.WinePrefix),
+          'WINEARCH=' + Param.WineArch,
+          'WINEDEBUG=-all'   # silence Wine's chatty stderr
+        ]
+
+      # Regex pattern for Windows executables.
+      - windows_cmd_pattern = r'.*\.(exe|bat|cmd|EXE|BAT|CMD)$'
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Env.File.Enter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'wine wrap done'"]
+
+    embeddedFiles:
+      - name: Enter
+        filename: enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Warm up the Wine prefix on first use so the first task doesn't
+          # eat the cost.
+          mkdir -p {{ repr_sh(string(Param.WinePrefix)) }}
+          WINEPREFIX={{ repr_sh(string(Param.WinePrefix)) }} \
+              WINEARCH={{ repr_sh(Param.WineArch) }} \
+              wineboot -u
+
+      - name: WrapTaskRun
+        filename: wine-wrap.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Decide at wrap-time whether to prepend `wine`. If Task.Command
+          # matches the Windows-exe regex, wrap it; otherwise pass through.
+          # repr_sh on the computed list keeps quoting safe either way.
+          exec env {{ repr_sh(wine_env) }} \
+              env {{ repr_sh(Task.Environment) }} \
+              {{ repr_sh(
+                   ['wine'] + [Task.Command] + Task.Args
+                   if re_match(Task.Command, windows_cmd_pattern)
+                   else [Task.Command] + Task.Args
+                 ) }}
+
+# Wine + OpenJD path mapping: when the scheduler applies path mapping to
+# Param.InputFile, it can rewrite Linux paths to Wine's Z: drive convention.
+# The wrap layer does not need to do anything special; the rewritten paths
+# arrive in Task.Args already in the form Wine expects.
+#
+# If you need to rewrite paths IN the wrap (for commands where the scheduler
+# can't know which args are paths), use a list comprehension similar to
+# koan #10, replacing the '/tmp/...' rewrite with a 'Z:' rewrite:
+#
+#   [
+#     'Z:' + a.replace('/', '\\') if a.startswith('/') else a
+#     for a in Task.Args
+#   ]

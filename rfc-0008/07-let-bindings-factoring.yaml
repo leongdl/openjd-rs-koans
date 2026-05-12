@@ -1,0 +1,126 @@
+# RFC 0008 / EXPR — let bindings to factor shared wrap logic
+#
+# Environment-scoped `let` bindings evaluate once when the env is entered, and
+# are reusable across every action + embedded file in that environment's
+# script. This is the cleanest way to:
+#
+#   - Stop duplicating long expressions across onEnter/onWrap*/onExit
+#   - Compute values once that multiple scripts need (container id,
+#     normalized image name, mount flag list, filter prefix sets)
+#   - Make wrap scripts read top-to-bottom like regular code
+#
+# The let bindings here are visible everywhere in `script:` — actions AND
+# embedded file data.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: Registry
+    type: STRING
+    default: "123456789012.dkr.ecr.us-west-2.amazonaws.com"
+  - name: Team
+    type: STRING
+    default: "vfx"
+  - name: AppName
+    type: STRING
+    default: "blender"
+  - name: Tag
+    type: STRING
+    default: "4.2"
+
+environment:
+  name: DockerFactored
+  script:
+    let:
+      # Compose the full image URI once.
+      - container_image = Param.Registry + '/' + Param.Team + '/' + Param.AppName + ':' + Param.Tag
+
+      # Registry hostname for `docker login`.
+      - registry_host = Param.Registry
+
+      # Paths we want bind-mounted in every exec. `path('...')` lets us mix
+      # literal paths and Session.WorkingDirectory uniformly.
+      - safe_mounts = [
+          Session.WorkingDirectory,
+          path('/mnt/assets'),
+          path('/mnt/licenses')
+        ]
+
+      # Flatten those into docker's --mount flags. Each entry becomes
+      #   --mount type=bind,src=/path,dst=/path
+      - mount_flags = flatten([
+          ['--mount', 'type=bind,src=' + string(m) + ',dst=' + string(m)]
+          for m in safe_mounts
+        ])
+
+      # A reusable secret-prefix blacklist.
+      - secret_prefixes = ['AWS_SECRET_', 'TOKEN_', 'PASSWORD', 'PRIVATE_']
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Env.File.Enter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["{{Env.File.Exit}}"]
+
+    embeddedFiles:
+      - name: Enter
+        filename: enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # `container_image` and `registry_host` are available here.
+          aws ecr get-login-password --region us-west-2 \
+              | docker login --username AWS --password-stdin {{ repr_sh(registry_host) }}
+
+          docker image pull {{ repr_sh(container_image) }}
+
+          # `mount_flags` is already a list[string] of docker flags,
+          # repr_sh'd once for safe expansion.
+          DOCKER_CONTAINER_ID=$(docker container run --rm \
+              --pull never --detach --network host \
+              {{ repr_sh(mount_flags) }} \
+              {{ repr_sh(container_image) }} \
+              bash -c 'sleep infinity')
+
+          echo "openjd_env: DOCKER_CONTAINER_ID=$DOCKER_CONTAINER_ID"
+
+      - name: WrapTaskRun
+        filename: wrap-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Same `secret_prefixes` list as onEnter would use — defined once.
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(flatten([
+                   ['-e', e]
+                   for e in Task.Environment
+                   if not any([e.startswith(p) for p in secret_prefixes])
+                 ])) }} \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh(Task.Args) }}
+
+      - name: Exit
+        filename: exit.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Simple, but still references `container_image` for log clarity.
+          echo "stopping {{ repr_sh(container_image) }}"
+          docker container stop --timeout 30 "$DOCKER_CONTAINER_ID" || true

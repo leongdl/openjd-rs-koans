@@ -1,0 +1,73 @@
+# RFC 0008 / EXPR — Conditional task command
+#
+# Demonstrates EXPR's ternary (`A if cond else B`) for building command-line
+# args. Three patterns cover most real use cases:
+#
+#   1. Scalar swap:   A if cond else B                     — picks a value
+#   2. Optional flag: '--flag' if cond else null           — emits or drops arg
+#   3. Grouped args:  [flag, value] if cond else null      — emits pair or drops
+#
+# Because the target type for each list item in `args` is `T? | list[T]`, a
+# `null` result skips the item and a `list[T]` result is flattened inline —
+# so the final `args` list ends up with exactly the tokens you want.
+
+specificationVersion: 'jobtemplate-2023-09'
+extensions:
+  - EXPR
+name: Conditional Render
+parameterDefinitions:
+  - name: SceneFile
+    type: PATH
+    objectType: FILE
+    dataFlow: IN
+  - name: Quality
+    type: STRING
+    allowedValues: ["draft", "final"]
+  - name: Verbose
+    type: STRING
+    allowedValues: ["true", "false"]
+    default: "false"
+  - name: Denoise
+    type: STRING
+    allowedValues: ["true", "false"]
+    default: "true"
+  - name: OutputDir
+    type: PATH
+    objectType: DIRECTORY
+    dataFlow: OUT
+steps:
+  - name: Render
+    parameterSpace:
+      taskParameterDefinitions:
+        - name: Frame
+          type: INT
+          range: "1-100"
+    script:
+      actions:
+        onRun:
+          command: blender
+          args:
+            - "--background"
+            - "{{Param.SceneFile}}"
+            - "--frame-set"
+            - "{{Task.Param.Frame}}"
+
+            # Scalar swap: --samples 128 for final, 16 for draft
+            - "--samples"
+            - "{{ 128 if Param.Quality == 'final' else 16 }}"
+
+            # Optional flag: emit --verbose only when true, otherwise drop
+            - "{{ '--verbose' if Param.Verbose == 'true' else null }}"
+
+            # Grouped args: flatten a pair when denoise is on, else drop both
+            - "{{ ['--denoise', 'OPTIX'] if Param.Denoise == 'true' else null }}"
+
+            # Path built with an EXPR conditional suffix
+            - "--output"
+            - "{{ Param.OutputDir / ('final' if Param.Quality == 'final' else 'draft') / 'frame_####.exr' }}"
+
+# Expected runtime command with Quality=final, Verbose=false, Denoise=true:
+#
+#   blender --background /scenes/x.blend --frame-set 1 \
+#       --samples 128 --denoise OPTIX \
+#       --output /renders/final/frame_####.exr

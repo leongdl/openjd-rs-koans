@@ -1,0 +1,137 @@
+# RFC 0008 / EXPR — Audit logging wrap
+#
+# Emit a structured JSON audit log line for every wrapped action — who ran
+# what, when, with which env, and what was the outcome. The actions
+# themselves then run unchanged. This is the "observability" sibling of the
+# echo-wrap dry run: real execution PLUS a tamper-evident audit trail.
+#
+# Output format is JSONL (one JSON object per line), which drops straight
+# into CloudWatch, Splunk, ELK, or a simple file tail.
+#
+# The trick: we log ONCE before and ONCE after, capturing the exit status.
+# `trap` catches abnormal exits so cancelled/crashed actions still show up
+# in the audit log with a non-zero status.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: AuditLog
+    type: PATH
+    default: "/var/log/openjd-audit.jsonl"
+    description: "File to append JSONL audit records to."
+
+environment:
+  name: AuditWrap
+  description: >
+    Appends a JSONL audit record for every inner env action and task run.
+    Fields: ts, phase, step, env_name, command, args, env_count, timeout,
+    status. No command contents are rewritten — actions run as-is.
+  script:
+    let:
+      # A reusable env-count summary (not the full env vars — PII/secrets risk).
+      - audit_phases = ['enter', 'task', 'exit']
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "touch {{ repr_sh(string(Param.AuditLog)) }}"]
+
+      onWrapEnter:
+        command: bash
+        args: ["{{Env.File.WrapEnter}}"]
+        timeout: "{{Env.Wrapped.Timeout}}"
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onWrapExit:
+        command: bash
+        args: ["{{Env.File.WrapExit}}"]
+        timeout: "{{Env.Wrapped.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'audit session ended'"]
+
+    embeddedFiles:
+      - name: WrapEnter
+        filename: audit-enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOG={{ repr_sh(string(Param.AuditLog)) }}
+          STATUS=0
+
+          # Emit a 'start' record. repr_json gives us a valid JSON value
+          # including proper escaping of every field — no string-building
+          # glue that can break on quotes.
+          echo {{ repr_sh(repr_json({
+            'phase': 'env_enter.start',
+            'step': Step.Name,
+            'env_name': Env.Wrapped.Name,
+            'command': Env.Wrapped.Command,
+            'args': Env.Wrapped.Args,
+            'env_count': len(Env.Wrapped.Environment),
+            'timeout': Env.Wrapped.Timeout
+          })) }} >> "$LOG"
+
+          # Run the wrapped action, preserving its exit code.
+          trap 'STATUS=$?; echo '\''{"phase":"env_enter.trap","status":'"$STATUS"'}'\'' >> "$LOG"' EXIT
+
+          {{ repr_sh(Env.Wrapped.Command) }} {{ repr_sh(Env.Wrapped.Args) }}
+          STATUS=$?
+
+          # Clear trap since we succeeded; emit a proper 'end' record.
+          trap - EXIT
+          echo {{ repr_sh(repr_json({
+            'phase': 'env_enter.end',
+            'env_name': Env.Wrapped.Name
+          })) }}", \"status\":$STATUS}" >> "$LOG"
+          exit $STATUS
+
+      - name: WrapTaskRun
+        filename: audit-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOG={{ repr_sh(string(Param.AuditLog)) }}
+
+          echo {{ repr_sh(repr_json({
+            'phase': 'task.start',
+            'step': Step.Name,
+            'command': Task.Command,
+            'args': Task.Args,
+            'env_count': len(Task.Environment),
+            'timeout': Task.Timeout
+          })) }} >> "$LOG"
+
+          STATUS=0
+          {{ repr_sh(Task.Command) }} {{ repr_sh(Task.Args) }} || STATUS=$?
+
+          echo {{ repr_sh(repr_json({
+            'phase': 'task.end',
+            'step': Step.Name
+          })) }}", \"status\":$STATUS}" >> "$LOG"
+          exit $STATUS
+
+      - name: WrapExit
+        filename: audit-exit.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOG={{ repr_sh(string(Param.AuditLog)) }}
+          echo {{ repr_sh(repr_json({
+            'phase': 'env_exit',
+            'step': Step.Name,
+            'env_name': Env.Wrapped.Name,
+            'command': Env.Wrapped.Command
+          })) }} >> "$LOG"
+          {{ repr_sh(Env.Wrapped.Command) }} {{ repr_sh(Env.Wrapped.Args) }}

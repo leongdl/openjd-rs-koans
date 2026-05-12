@@ -1,0 +1,110 @@
+# RFC 0008 / EXPR — Retry with exponential backoff wrap
+#
+# Wrap every task run with bounded retry + exponential backoff. Useful for
+# jobs that hit flaky external dependencies (license servers, S3, remote
+# NFS) where most failures are transient.
+#
+# EXPR contributes:
+#   - `range()` to build the retry attempt list
+#   - `min()` to cap backoff at a ceiling
+#   - Parameter-driven retry count and cap
+#   - `fail()` preflight to reject nonsensical retry counts
+#
+# Only onWrapTaskRun is retried. Env setup/teardown is NOT retried because
+# it's usually side-effecting and retry semantics are tricky — keep it
+# simple.
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: MaxRetries
+    type: INT
+    default: 3
+  - name: BackoffBase
+    type: INT
+    default: 2
+    description: "Seconds: sleep between retries is BackoffBase ** attempt, capped at BackoffCap."
+  - name: BackoffCap
+    type: INT
+    default: 60
+
+environment:
+  name: RetryWrap
+  description: >
+    Retry-with-backoff wrap for task runs. MaxRetries attempts total; each
+    failure sleeps for min(BackoffBase ** attempt, BackoffCap) seconds.
+  script:
+    let:
+      # Preflight: reject pathological configs before any task runs.
+      - _check_retries = (
+          Param.MaxRetries >= 1 and Param.MaxRetries <= 20
+          or fail('MaxRetries must be between 1 and 20')
+        )
+      - _check_base = (
+          Param.BackoffBase >= 1
+          or fail('BackoffBase must be >= 1')
+        )
+
+      # Precompute the sleep durations so the shell doesn't have to.
+      # min() caps each at BackoffCap. Element 0 is used after attempt 1.
+      - sleep_schedule = [
+          min(Param.BackoffBase ** i, Param.BackoffCap)
+          for i in range(Param.MaxRetries)
+        ]
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["-c", "echo 'retry-wrap session ready'"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        # Give the wrap enough time for all attempts + all sleeps.
+        timeout: "{{ Task.Timeout * Param.MaxRetries + sum(sleep_schedule) }}"
+
+      onExit:
+        command: bash
+        args: ["-c", "echo 'retry-wrap session ended'"]
+
+    embeddedFiles:
+      - name: WrapTaskRun
+        filename: retry.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -uo pipefail   # note: NOT -e; we want to inspect the exit code
+
+          MAX_RETRIES={{ Param.MaxRetries }}
+          SLEEPS=({{ sleep_schedule.join(' ') }})
+
+          for attempt in $(seq 1 "$MAX_RETRIES"); do
+              echo "[retry-wrap] attempt $attempt/$MAX_RETRIES"
+
+              {{ repr_sh(Task.Command) }} {{ repr_sh(Task.Args) }}
+              STATUS=$?
+              if [ "$STATUS" -eq 0 ]; then
+                  echo "[retry-wrap] success on attempt $attempt"
+                  exit 0
+              fi
+
+              if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                  SLEEP=${SLEEPS[$((attempt - 1))]}
+                  echo "[retry-wrap] attempt $attempt failed (exit $STATUS), sleeping ${SLEEP}s"
+                  sleep "$SLEEP"
+              fi
+          done
+
+          echo "[retry-wrap] all $MAX_RETRIES attempts failed, last status $STATUS"
+          exit "$STATUS"
+
+# NOTE on cancellation: the outer scheduler can still cancel this wrap via
+# SIGTERM. To honor cancellation promptly, add a trap that forwards the
+# signal to any in-flight child and exits:
+#
+#     trap 'kill -TERM $CHILD_PID 2>/dev/null; exit 130' TERM
+#
+# We skip that here for readability, but it's essential in production.

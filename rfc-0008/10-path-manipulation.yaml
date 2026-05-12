@@ -1,0 +1,112 @@
+# RFC 0008 / EXPR — Path manipulation for mounts, outputs, and bind lists
+#
+# path is a first-class EXPR type with `/`, `+`, `.name`, `.parent`,
+# `.with_suffix`, `.parts`. That means a wrap hook can synthesize bind-mount
+# lists or rewrite output paths declaratively — no sed, no awk.
+#
+# Patterns shown:
+#   1. Synthesize bind-mounts from the set of paths the task touches
+#   2. Rewrite a single arg: redirect any *.log output into a container-local
+#      scratch directory while leaving other args untouched
+#   3. Use .parts and slicing to extract just the last N components
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: SceneFile
+    type: PATH
+    objectType: FILE
+    dataFlow: IN
+  - name: OutputDir
+    type: PATH
+    objectType: DIRECTORY
+    dataFlow: OUT
+
+environment:
+  name: DockerPathSmart
+  script:
+    let:
+      # Pattern 1: compute the set of directories that must be bind-mounted
+      # based on which paths the task will touch. `.parent` lifts each file
+      # to its containing dir, `unique` + `sorted` keep the list tight and
+      # deterministic.
+      - touched_dirs = unique(sorted([
+          Param.SceneFile.parent,
+          Param.OutputDir,
+          Session.WorkingDirectory
+        ]))
+
+      # Turn each path into a docker bind-mount flag pair.
+      - mount_flags = flatten([
+          ['--mount', 'type=bind,src=' + string(d) + ',dst=' + string(d)]
+          for d in touched_dirs
+        ])
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Env.File.Enter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["-c", "docker container stop --timeout 30 $DOCKER_CONTAINER_ID || true"]
+
+    embeddedFiles:
+      - name: Enter
+        filename: enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # `mount_flags` was computed once up in `let` — reused here verbatim.
+          DOCKER_CONTAINER_ID=$(docker container run --rm \
+              --pull never --detach --network host \
+              {{ repr_sh(mount_flags) }} \
+              'ubuntu:latest' \
+              bash -c 'sleep infinity')
+          echo "openjd_env: DOCKER_CONTAINER_ID=$DOCKER_CONTAINER_ID"
+
+      - name: WrapTaskRun
+        filename: wrap-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Pattern 2: rewrite *.log args to live in a container-local scratch.
+          # path(a).name pulls just the filename; the list comprehension
+          # passes non-.log args through unchanged.
+          #
+          # Pattern 3: if the scene file lives deep in a tree, show the last
+          # three components for readability in log lines.
+          #    Param.SceneFile.parts[-3:].join('/')
+          echo "[wrap] scene: {{ Param.SceneFile.parts[-3:].join('/') }}"
+
+          docker container exec \
+              "$DOCKER_CONTAINER_ID" \
+              {{ repr_sh(Task.Command) }} \
+              {{ repr_sh([
+                   a if not a.endswith('.log')
+                     else '/tmp/' + path(a).name
+                   for a in Task.Args
+                 ]) }}
+
+# Examples of what the rewritten args look like:
+#
+#   Input  Task.Args = ['render', '/home/user/job/debug.log', '--frames', '1-10']
+#   Output                ['render', '/tmp/debug.log',        '--frames', '1-10']
+#
+#   Input  Task.Args = ['--log=/var/log/myapp/run.log', 'out.exr']
+#   Output                ['--log=/var/log/myapp/run.log', 'out.exr']
+#        (the `--log=...` form doesn't end in .log by token, so it's untouched;
+#         if you want to rewrite those too, match with re_sub or split('=')
+#         rather than endswith)

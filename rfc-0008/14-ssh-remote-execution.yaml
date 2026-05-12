@@ -1,0 +1,98 @@
+# RFC 0008 / EXPR — SSH remote execution wrap
+#
+# Forward every wrapped action to a remote host via SSH. The worker acts as a
+# thin coordinator; the actual work happens on the SSH target.
+#
+# Why this matters:
+#   - Delegate to a dedicated licensed-software host
+#   - Run GPU jobs on a workstation from a CPU-only coordinator
+#   - Integrate with any SSH-reachable machine without provisioning
+#     scheduler-specific workers on it
+#
+# Key EXPR pattern: DOUBLE-ESCAPING.
+#   When ssh forwards a command, it concatenates its argv with spaces and
+#   hands the resulting string to the remote user's shell. So we need two
+#   levels of shell quoting — one for the remote shell (to preserve tokens
+#   across ssh's space-join), then one for the local shell (to pass the
+#   whole remote-command string as a single argv to ssh).
+
+specificationVersion: "environment-2023-09"
+extensions:
+  - WRAP_ACTIONS
+  - EXPR
+
+parameterDefinitions:
+  - name: RemoteHost
+    type: STRING
+    description: "SSH target, e.g. user@render01.studio.local"
+  - name: RemoteRoot
+    type: STRING
+    default: "/scratch/openjd"
+
+environment:
+  name: SSHWrap
+  description: >
+    Forwards every wrapped action to a remote host via SSH. Stdin/stdout
+    forward transparently so openjd_env lines still propagate back.
+  script:
+    let:
+      # Mirror the session dir on the remote so absolute paths survive.
+      - remote_session_dir = Param.RemoteRoot + '/' + Session.WorkingDirectory.name
+      - ssh_opts = ['-T', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30']
+
+    actions:
+      onEnter:
+        command: bash
+        args: ["{{Env.File.Enter}}"]
+
+      onWrapTaskRun:
+        command: bash
+        args: ["{{Env.File.WrapTaskRun}}"]
+        timeout: "{{Task.Timeout}}"
+
+      onExit:
+        command: bash
+        args: ["{{Env.File.Exit}}"]
+
+    embeddedFiles:
+      - name: Enter
+        filename: enter.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ssh {{ repr_sh(ssh_opts) }} {{ repr_sh(Param.RemoteHost) }} \
+              mkdir -p {{ repr_sh(remote_session_dir) }}
+
+      - name: WrapTaskRun
+        filename: wrap-task.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Step 1: build the remote-side command string. Each fragment is
+          #         pre-quoted with repr_sh for REMOTE shell syntax.
+          # Step 2: pass the whole string as ONE argv to ssh by wrapping it
+          #         with repr_sh once more for LOCAL shell syntax.
+          #
+          # Without the inner quoting, a Task.Arg containing spaces would
+          # be split by the remote shell. Without the outer quoting, the
+          # local shell would split the inner-quoted string at whitespace
+          # before ssh ever sees it. Both levels are required.
+          ssh {{ repr_sh(ssh_opts) }} {{ repr_sh(Param.RemoteHost) }} \
+              {{ repr_sh(
+                   'cd ' + repr_sh(remote_session_dir) + ' && '
+                   + 'env ' + repr_sh(Task.Environment) + ' '
+                   + repr_sh(Task.Command) + ' '
+                   + repr_sh(Task.Args)
+                 ) }}
+
+      - name: Exit
+        filename: exit.sh
+        type: TEXT
+        data: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ssh {{ repr_sh(ssh_opts) }} {{ repr_sh(Param.RemoteHost) }} \
+              rm -rf {{ repr_sh(remote_session_dir) }} || true
