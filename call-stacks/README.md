@@ -33,3 +33,4 @@ into session state.
 - [04 — Embedded files materialized to disk](runtime/04-embedded-files-materialization.md)
 - [05 — Path-mapping rules at session start](runtime/05-path-mapping-materialization.md)
 - [06 — `openjd_env` stdout directive flow](runtime/06-openjd-env-stdout-directives.md)
+- [07 — Resolving wrap actions (RFC 0008)](runtime/07-wrap-action-resolution.md)
